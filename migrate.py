@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
 migrate.py
-PySpark batch migration template for large-scale data transfer to S3 / Azure Blob / staging for Snowflake.
+PySpark batch migration learning template for large-scale data transfer (2PB+) 
+to both AWS S3 (s3a://) and Azure ADLS Gen2 (abfss://).
 
-Usage:
-  spark-submit \
-    --conf spark.executor.memory=... \
-    --conf spark.executor.cores=... \
-    migrate.py \
-    --source-type parquet \
-    --source-path hdfs://nn:8020/path/to/data \
-    --target-uri s3a://my-bucket/path \
-    --total-bytes 2199023255552 \
-    --target-file-size 268435456 \
-    --parallelism 4096 \
-    --format parquet \
-    --partition-cols dt,region
+Usage (Azure ABFS example):
+  spark-submit migrate.py \
+      --source-type parquet \
+      --source-path hdfs://nn:8020/path/to/data \
+      --target-uri abfss://container@account.dfs.core.windows.net/prefix \
+      --total-bytes 2199023255552 \
+      --use-managed-identity true
+
+Usage (AWS S3 example):
+  spark-submit migrate.py \
+      --source-type parquet \
+      --source-path hdfs://nn:8020/path/to/data \
+      --target-uri s3a://my-bucket/prefix \
+      --total-bytes 2199023255552
 """
 import argparse
 import logging
-import sys
 import math
+import os
+import re
 import time
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
@@ -28,10 +31,9 @@ import pyspark.sql.functions as F
 LOG = logging.getLogger("migrate")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-def build_spark(app_name="large-migrate", extra_conf=None):
+def build_spark(app_name="universal-migrate-2pb", extra_conf=None):
     builder = SparkSession.builder.appName(app_name)
-    
-    # Generic tuning placeholders - customize per cloud and instance types
+    # Generic tuning placeholders - customize per cluster instance/VM SKU
     builder = builder.config("spark.sql.shuffle.partitions", "2000") \
                      .config("spark.sql.files.maxPartitionBytes", str(256 * 1024 * 1024)) \
                      .config("spark.sql.files.openCostInBytes", str(4 * 1024 * 1024))
@@ -41,32 +43,97 @@ def build_spark(app_name="large-migrate", extra_conf=None):
     spark = builder.getOrCreate()
     return spark
 
-def set_s3_options(spark, s3_opts):
-    # Example Hadoop/S3A tuning for high parallelism uploads
+def set_hadoop_conf(spark, conf_dict):
+    """
+    Set Hadoop configuration entries (via Java HadoopConfiguration) for S3A or ABFS tuning.
+    """
     hconf = spark.sparkContext._jsc.hadoopConfiguration()
-    for k, v in s3_opts.items():
+    for k, v in conf_dict.items():
         hconf.set(k, v)
 
+# ==========================================
+# AWS S3 Configuration
+# ==========================================
+def configure_s3(spark, s3_endpoint=None):
+    LOG.info("Configuring Hadoop properties for AWS S3 (s3a://)...")
+    s3_opts = {
+        "fs.s3a.connection.maximum": "1000",
+        "fs.s3a.multipart.size": str(64 * 1024 * 1024), # 64MB parts
+        "fs.s3a.threads.max": "512",
+        "fs.s3a.fast.upload": "true",
+        "fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+        "fs.s3a.buffer.dir": "/mnt/spark_s3_buffer",
+    }
+    if s3_endpoint:
+        s3_opts["fs.s3a.endpoint"] = s3_endpoint
+    set_hadoop_conf(spark, s3_opts)
+
+# ==========================================
+# Azure ADLS Gen2 (ABFS) Configuration
+# ==========================================
+def parse_abfss_target(abfss_uri):
+    # Strip scheme: abfss://container@account.dfs.core.windows.net/prefix
+    m = re.match(r"abfss://([^@]+)@([^/]+)(?:/(.*))?", abfss_uri)
+    if not m:
+        raise ValueError("Invalid abfss URI: {}".format(abfss_uri))
+    container = m.group(1)
+    host = m.group(2)  # account.dfs.core.windows.net
+    prefix = m.group(3) or ""
+    account = host.split(".")[0]
+    return account, container, prefix
+
+def configure_abfs_for_account(spark, account, use_managed_identity=False,
+                               client_id=None, client_secret=None, tenant_id=None,
+                               abfs_opts_override=None):
+    LOG.info("Configuring Hadoop properties for Azure ADLS Gen2 (abfss://)...")
+    conf = {}
+    account_fqdn = f"{account}.dfs.core.windows.net"
+
+    conf[f"fs.azure.account.auth.type.{account_fqdn}"] = "OAuth"
+
+    if use_managed_identity:
+        LOG.info("Using Azure Managed Identity for Auth.")
+        conf[f"fs.azure.account.oauth.provider.type.{account_fqdn}"] = \
+            "org.apache.hadoop.fs.azurebfs.oauth2.ManagedIdentityTokenProvider"
+        if client_id:
+            conf[f"fs.azure.account.oauth2.client.id.{account_fqdn}"] = client_id
+    else:
+        LOG.info("Using Azure Service Principal (Client Credentials) for Auth.")
+        conf[f"fs.azure.account.oauth.provider.type.{account_fqdn}"] = \
+            "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider"
+        if not (client_id and client_secret and tenant_id):
+            LOG.warning("Service principal auth selected but AZURE_CLIENT_ID/SECRET/TENANT not provided fully!")
+        if client_id:
+            conf[f"fs.azure.account.oauth2.client.id.{account_fqdn}"] = client_id
+        if client_secret:
+            conf[f"fs.azure.account.oauth2.client.secret.{account_fqdn}"] = client_secret
+        if tenant_id:
+            conf[f"fs.azure.account.oauth2.client.endpoint.{account_fqdn}"] = \
+                f"https://login.microsoftonline.com/{tenant_id}/oauth2/token"
+
+    # Tuning knobs for high throughput
+    conf[f"fs.azure.max.concurrent.requests"] = "256"
+    conf[f"dfs.client.read.shortcircuit"] = "false"
+    
+    if abfs_opts_override:
+        conf.update(abfs_opts_override)
+        
+    set_hadoop_conf(spark, conf)
+    return conf
+
+# ==========================================
+# Core Migration Logic
+# ==========================================
 def estimate_partitions(total_bytes, target_file_size, parallelism_hint=None):
-    # number of output files = total_bytes / target_file_size
     files = max(1, int(math.ceil(total_bytes / float(target_file_size))))
-    # partitions (Spark tasks) should be >= files and also tuned for cluster
     partitions = max(files, 1)
     if parallelism_hint:
         partitions = max(partitions, parallelism_hint)
-    # cap partitions to avoid tiny tasks (caller should choose reasonable parallelism)
     return partitions
 
 def read_source(spark, source_type, source_path, read_opts):
     fmt = source_type.lower()
-    if fmt in ("parquet", "orc", "avro"):
-        df = spark.read.format(fmt).options(**read_opts).load(source_path)
-    elif fmt in ("csv", "text"):
-        df = spark.read.format(fmt).options(**read_opts).load(source_path)
-    else:
-        # generic format fallback
-        df = spark.read.format(fmt).options(**read_opts).load(source_path)
-    return df
+    return spark.read.format(fmt).options(**read_opts).load(source_path)
 
 def write_target(df, target_uri, fmt="parquet", partition_cols=None, compression="zstd",
                  max_records_per_file=None, target_file_size=None):
@@ -78,89 +145,73 @@ def write_target(df, target_uri, fmt="parquet", partition_cols=None, compression
         writer = writer.partitionBy(*partition_cols)
     writer.save(target_uri)
 
-def stage_for_snowflake(s3_uri_prefix, snowflake_stage_name, aws_role_arn=None):
-    # Placeholder: write files to S3 prefix, create Snowflake stage, then COPY INTO.
-    pass
-
 def main():
     parser = argparse.ArgumentParser()
+    # Common Args
     parser.add_argument("--source-type", required=True, help="parquet|orc|csv|avro|...")
     parser.add_argument("--source-path", required=True)
-    parser.add_argument("--target-uri", required=True, help="s3a://bucket/prefix or abfss://container@acct.dfs.core.windows.net/prefix")
+    parser.add_argument("--target-uri", required=True, help="s3a://... or abfss://...")
     parser.add_argument("--format", default="parquet")
-    parser.add_argument("--total-bytes", type=float, required=False,
-                        help="Estimated total bytes to migrate (used to compute partitions). Optional but recommended.")
-    parser.add_argument("--target-file-size", type=int, default=256 * 1024 * 1024,
-                        help="Target output file size in bytes (default 256MB).")
-    parser.add_argument("--parallelism", type=int, default=None, help="Minimum desired parallelism (num partitions).")
-    parser.add_argument("--partition-cols", default=None, help="Comma-separated partition columns for target.")
-    parser.add_argument("--compression", default="zstd", help="parquet compression codec (zstd/snappy/gzip)")
+    parser.add_argument("--total-bytes", type=float, required=False)
+    parser.add_argument("--target-file-size", type=int, default=256 * 1024 * 1024)
+    parser.add_argument("--parallelism", type=int, default=None)
+    parser.add_argument("--partition-cols", default=None)
+    parser.add_argument("--compression", default="zstd")
     parser.add_argument("--max-records-per-file", type=int, default=None)
+    
+    # S3 Specific Args
     parser.add_argument("--s3-endpoint", default=None)
+    
+    # Azure Specific Args
+    parser.add_argument("--use-managed-identity", type=lambda s: s.lower() == "true", default=False)
+    parser.add_argument("--azure-client-id", default=None)
+    parser.add_argument("--azure-client-secret", default=None)
+    parser.add_argument("--azure-tenant-id", default=None)
     args = parser.parse_args()
 
+    # Pre-Spark Configuration overrides
     extra_conf = {}
-    # Example S3 tuning: tune for high parallel upload concurrency
-    if args.target_uri.startswith("s3a://"):
+    if args.target_uri.startswith("abfss://"):
         extra_conf.update({
-            "spark.hadoop.fs.s3a.connection.maximum": "1000",
-            "spark.hadoop.fs.s3a.threads.max": "512",
-            "spark.hadoop.fs.s3a.multipart.size": str(64 * 1024 * 1024),  # 64MB parts
-            "spark.hadoop.fs.s3a.fast.upload": "true",
-            "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+            "spark.hadoop.fs.abfss.impl": "org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem",
+            "spark.sql.files.openCostInBytes": str(4 * 1024 * 1024),
         })
-        if args.s3_endpoint:
-            extra_conf["spark.hadoop.fs.s3a.endpoint"] = args.s3_endpoint
 
     spark = build_spark(extra_conf=extra_conf)
     LOG.info("Spark started: %s", spark)
 
-    # Additional S3 Hadoop configuration via sparkContext
-    s3_opts = {
-        "fs.s3a.connection.maximum": "1000",
-        "fs.s3a.multipart.size": str(64 * 1024 * 1024),
-        "fs.s3a.threads.max": "512",
-        "fs.s3a.buffer.dir": "/mnt/spark_s3_buffer",
-        # Ensure credentials set via environment / instance role
-    }
+    # Apply Storage specific tuning via Hadoop configs
     if args.target_uri.startswith("s3a://"):
-        set_s3_options(spark, s3_opts)
+        configure_s3(spark, args.s3_endpoint)
+    elif args.target_uri.startswith("abfss://"):
+        account, container, prefix = parse_abfss_target(args.target_uri)
+        client_id = args.azure_client_id or os.environ.get("AZURE_CLIENT_ID")
+        client_secret = args.azure_client_secret or os.environ.get("AZURE_CLIENT_SECRET")
+        tenant_id = args.azure_tenant_id or os.environ.get("AZURE_TENANT_ID")
+        configure_abfs_for_account(spark, account, args.use_managed_identity, client_id, client_secret, tenant_id)
+    else:
+        LOG.warning("Target URI does not start with s3a:// or abfss://. Bypassing specific tuning.")
 
-    read_opts = {}
-    if args.source_type.lower() == "csv":
-        read_opts.update({"header": "true", "inferSchema": "false"})
+    # Read
+    read_opts = {"header": "true", "inferSchema": "false"} if args.source_type.lower() == "csv" else {}
     df = read_source(spark, args.source_type, args.source_path, read_opts)
-    LOG.info("Schema read: %s", df.schema.simpleString())
 
-    # Estimate partitions
-    partitions = None
-    if args.total_bytes:
-        partitions = estimate_partitions(args.total_bytes, args.target_file_size, args.parallelism)
-        LOG.info("Estimated partitions based on total_bytes=%s, target_file_size=%s -> %s partitions",
-                 args.total_bytes, args.target_file_size, partitions)
-
+    # Estimate Partitions
+    partitions = estimate_partitions(args.total_bytes, args.target_file_size, args.parallelism) if args.total_bytes else None
     if partitions:
-        # Repartition by hash of partition columns if provided, else by round-robin
         if args.partition_cols:
             pcols = [c.strip() for c in args.partition_cols.split(",") if c.strip()]
             df = df.repartition(partitions, *[F.col(c) for c in pcols])
         else:
             df = df.repartition(partitions)
         LOG.info("Repartitioned to %d partitions", partitions)
-    else:
-        LOG.info("No partitions computed; using source partitions")
 
+    # Write
     partition_cols = [c.strip() for c in args.partition_cols.split(",")] if args.partition_cols else None
-
     start = time.time()
     try:
-        write_target(df,
-                     args.target_uri,
-                     fmt=args.format,
-                     partition_cols=partition_cols,
-                     compression=args.compression,
-                     max_records_per_file=args.max_records_per_file,
-                     target_file_size=args.target_file_size)
+        write_target(df, args.target_uri, fmt=args.format, partition_cols=partition_cols,
+                     compression=args.compression, max_records_per_file=args.max_records_per_file)
     except Exception as e:
         LOG.exception("Write failed: %s", e)
         raise
