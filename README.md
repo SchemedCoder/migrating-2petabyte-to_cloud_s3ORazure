@@ -1,43 +1,15 @@
-# Universal 2PB Cloud Data Migration Learning Repository
+# Enterprise Data Migration & Engineering Repository
 
-This repository serves as a **Learning Template** for PySpark Data Engineers tasked with migrating Petabyte-scale data from on-premise distributed file systems (HDFS, NFS) directly into Cloud Object Storage.
+This repository is a comprehensive learning and implementation guide for Enterprise Data Engineering. It covers the full spectrum of data ingestion, from transferring 2 Petabytes of raw files, to pulling 300 million rows from an RDBMS, to handling rate-limited REST APIs and building Delta Lake CDC pipelines.
 
-Unlike standard JDBC extraction which pulls from relational databases row-by-row, this template handles massive file-to-file transfers, utilizing highly concurrent network streams, dynamic partition estimation, and cloud-specific Hadoop tuning parameters.
+## 📚 Theory Directory (Architectural Concepts)
+Before deploying code, engineers must understand the network and architectural boundaries.
+* [`theory/01_Ingestion_Patterns_Matrix.md`](theory/01_Ingestion_Patterns_Matrix.md) - Permutations and combinations of Source-to-Target migrations.
+* [`theory/02_Network_and_Security_Boundaries.md`](theory/02_Network_and_Security_Boundaries.md) - Details on Public, Private/Hybrid (SHIR), Managed VNet, and Air-Gapped architectures.
+* [`theory/03_Medallion_Architecture.md`](theory/03_Medallion_Architecture.md) - The Bronze, Silver, and Gold data lakehouse layers.
 
-**It natively supports both AWS S3 (`s3a://`) and Azure Data Lake Storage Gen2 (`abfss://`).**
-
-## Features
-- **Dual Cloud Support:** Automatically detects your `target_uri` and applies the correct Hadoop Configurations for either AWS S3 or Azure ADLS.
-- **Dynamic Partitioning:** Estimates the optimal number of parallel write streams based on `total_bytes` and `target_file_size` (e.g. 256MB).
-- **Azure Authentication:** Supports both Azure Managed Identity and Service Principal (OAuth) credentials.
-- **High Throughput Tuning:** Injects specific parameters like `fs.s3a.multipart.size` and `fs.azure.max.concurrent.requests` directly into the Spark Context.
-
-## Usage: AWS S3 Target
-```bash
-spark-submit \
-    --conf spark.executor.memory=32g \
-    --conf spark.executor.cores=8 \
-    migrate.py \
-    --source-type parquet \
-    --source-path hdfs://nn:8020/path/to/data \
-    --target-uri s3a://my-bucket/path \
-    --total-bytes 2199023255552 \
-    --target-file-size 268435456
-```
-
-## Usage: Azure ADLS Gen2 Target (ABFS)
-```bash
-# Example using Managed Identity
-spark-submit \
-    --conf spark.executor.memory=32g \
-    --conf spark.executor.cores=8 \
-    migrate.py \
-    --source-type parquet \
-    --source-path hdfs://nn:8020/path/to/data \
-    --target-uri abfss://container@account.dfs.core.windows.net/prefix \
-    --total-bytes 2199023255552 \
-    --target-file-size 268435456 \
-    --use-managed-identity true
-```
-
-*Note: If using an Azure Service Principal instead of Managed Identity, ensure you pass the variables via environment variables `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, and `AZURE_TENANT_ID`, or pass them explicitly via the CLI arguments.*
+## 💻 Code Directory (Production-Ready Templates)
+* [`migrate.py`](migrate.py) - (Root) The massive 2PB File-to-Cloud Object Storage migration script (AWS S3 & Azure ABFS).
+* [`code/02_rdbms_jdbc_partitioning/jdbc_parallel_extract.py`](code/02_rdbms_jdbc_partitioning/jdbc_parallel_extract.py) - How to safely extract 30 Crore (300M) rows from SQL databases without locking the source.
+* [`code/03_rest_api_ingestion/api_pagination_backoff.py`](code/03_rest_api_ingestion/api_pagination_backoff.py) - Robust REST API ingestion handling HTTP 429 Rate Limits and Cursor Pagination.
+* [`code/04_cdc_delta_lake/merge_upsert_silver.py`](code/04_cdc_delta_lake/merge_upsert_silver.py) - Idempotent Change Data Capture (CDC) processing using Delta Lake `MERGE INTO`.
