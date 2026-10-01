@@ -1,6 +1,5 @@
 """
 jdbc_parallel_extract.py
-
 Demonstrates how to extract massive relational tables (e.g., 30 Crore / 300 Million rows) 
 from an RDBMS like PostgreSQL/SQL Server without locking the source database.
 
